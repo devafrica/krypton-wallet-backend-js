@@ -4,6 +4,8 @@
 
 import { MixinLimit, MixinLimits } from './MixinLimits';
 
+const version = require('../../package.json').version;
+
 /**
  * Configuration for the wallet backend.
  *
@@ -151,6 +153,36 @@ export interface IConfig {
      * more than 100.
      */
     blocksPerDaemonRequest?: number;
+
+    /**
+     * The amount of seconds to permit not having fetched a block from the
+     * daemon before emitting 'deadnode'. Note that this just means contacting
+     * the daemon for data - if you are synced and it returns TopBlock - the
+     * event will not be emitted.
+     */
+    maxLastFetchedBlockInterval?: number;
+
+    /**
+     * The amount of seconds to permit not having fetched a new network height
+     * from the daemon before emitting 'deadnode'.
+     */
+    maxLastUpdatedNetworkHeightInterval?: number;
+
+    /**
+     * The amount of seconds to permit not having fetched a new local height
+     * from the daemon before emitting 'deadnode'.
+     */
+    maxLastUpdatedLocalHeightInterval?: number;
+
+    /**
+     * Allows specifying a custom user agent string to use with requests.
+     */
+    customUserAgentString?: string;
+
+    /**
+     * Allows specifying a custom configuration object for the request module.
+     */
+    customRequestOptions?: any;
 
     [key: string]: any;
 }
@@ -309,6 +341,36 @@ export class Config implements IConfig {
      * more than 100.
      */
     public blocksPerDaemonRequest: number = 100;
+
+    /**
+     * The amount of seconds to permit not having fetched a block from the
+     * daemon before emitting 'deadnode'. Note that this just means contacting
+     * the daemon for data - if you are synced and it returns TopBlock - the
+     * event will not be emitted.
+     */
+    public maxLastFetchedBlockInterval: number = 60 * 3;
+
+    /**
+     * The amount of seconds to permit not having fetched a new network height
+     * from the daemon before emitting 'deadnode'.
+     */
+    public maxLastUpdatedNetworkHeightInterval: number = 60 * 3;
+
+    /**
+     * The amount of seconds to permit not having fetched a new local height
+     * from the daemon before emitting 'deadnode'.
+     */
+    public maxLastUpdatedLocalHeightInterval: number = 60 * 3;
+
+    /**
+     * Allows setting a customer user agent string
+     */
+    public customUserAgentString: string = `${this.ticker.toLowerCase()}-wallet-backend-${version}`;
+
+    /**
+     * Allows specifying a custom configuration object for the request module.
+     */
+    public customRequestOptions: any = {};
 
     [key: string]: any;
 }

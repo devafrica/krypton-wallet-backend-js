@@ -241,6 +241,31 @@ export declare interface WalletBackend {
         walletBlockCount: number,
         localDaemonBlockCount: number,
         networkBlockCount: number) => void): this;
+
+    /**
+     * This is emitted when we consider the node to no longer be online. There
+     * are a few categories we use to determine this.
+     *
+     * 1) We have not recieved any data from /getwalletsyncdata since the
+     *    configured timeout. (Default 3 mins)
+     *
+     * 2) The network height has not changed since the configured timeout
+     *   (Default 3 mins)
+     *
+     * 3) The local daemon height has not changed since the configured timeout
+     *   (Default 3 mins)
+     *
+     * Example:
+     *
+     * ```javascript
+     * wallet.on('deadnode', () => {
+     *     console.log('Ruh roh, looks like the daemon is dead.. maybe you want to swapNode()?');
+     * });
+     * ```
+     *
+     * @event
+     */
+    on(event: 'deadnode', callback: () => void): this;
 }
 
 /**
@@ -673,17 +698,17 @@ export class WalletBackend extends EventEmitter {
     /**
      * Executes the main loop every n seconds for us
      */
-    private syncThread: Metronome;
+    private syncThread!: Metronome;
 
     /**
      * Update daemon info every n seconds
      */
-    private daemonUpdateThread: Metronome;
+    private daemonUpdateThread!: Metronome;
 
     /**
      * Check on locked tx status every n seconds
      */
-    private lockedTransactionsCheckThread: Metronome;
+    private lockedTransactionsCheckThread!: Metronome;
 
     /**
      * Whether our wallet is synced. Used for selectively firing the sync/desync
@@ -715,7 +740,7 @@ export class WalletBackend extends EventEmitter {
     /**
      * Should we perform auto optimization when next synced
      */
-    private shouldPerformAutoOptimize: boolean = false;
+    private shouldPerformAutoOptimize: boolean = true;
 
     /**
      * Are we in the middle of an optimization?
@@ -728,6 +753,12 @@ export class WalletBackend extends EventEmitter {
     private currentlyTransacting: boolean = false;
 
     private config: Config;
+
+    /**
+     * We only want to submit dead node once, then reset the flag when we
+     * swap node or the node comes back online.
+     */
+    private haveEmittedDeadNode: boolean = false;
 
     /**
      * @param newWallet Are we creating a new wallet? If so, it will start
@@ -773,47 +804,9 @@ export class WalletBackend extends EventEmitter {
             privateViewKey, this.config,
         );
 
-        this.walletSynchronizer.on('heightchange', (walletHeight) => {
-            this.emit(
-                'heightchange',
-                walletHeight,
-                this.daemon.getLocalDaemonBlockCount(),
-                this.daemon.getNetworkBlockCount()
-            );
-        });
+        this.setupEventHandlers();
 
-        /* Passing through events from daemon to users */
-        this.daemon.on('disconnect', () => {
-            this.emit('disconnect');
-        });
-
-        this.daemon.on('connect', () => {
-            this.emit('connect');
-        });
-
-        this.daemon.on('heightchange', (localDaemonBlockCount, networkDaemonBlockCount) => {
-            this.emit(
-                'heightchange',
-                this.walletSynchronizer.getHeight(),
-                localDaemonBlockCount,
-                networkDaemonBlockCount,
-            );
-        });
-
-        this.syncThread = new Metronome(
-            () => this.sync(true),
-            this.config.syncThreadInterval,
-        );
-
-        this.daemonUpdateThread = new Metronome(
-            () => this.updateDaemonInfo(),
-            this.config.daemonUpdateInterval,
-        );
-
-        this.lockedTransactionsCheckThread = new Metronome(
-            () => this.checkLockedTransactions(),
-            this.config.lockedTransactionsCheckInterval,
-        );
+        this.setupMetronomes();
     }
 
     /**
@@ -849,6 +842,8 @@ export class WalletBackend extends EventEmitter {
         this.daemon = newDaemon;
 
         this.walletSynchronizer.swapNode(newDaemon);
+
+        this.haveEmittedDeadNode = false;
 
         if (shouldRestart) {
             await this.start();
@@ -978,6 +973,184 @@ export class WalletBackend extends EventEmitter {
             this.daemon.getLocalDaemonBlockCount(),
             this.daemon.getNetworkBlockCount()
         );
+    }
+
+    /**
+     * Adds a subwallet to the wallet container. Must not be used on a view
+     * only wallet. For more information on subwallets, see https://docs.turtlecoin.lol/developer/subwallets
+     *
+     * Example:
+     * ```javascript
+     * const [address, error] = wallet.addSubWallet();
+     *
+     * if (!error) {
+     *      console.log(`Created subwallet with address of ${address}`);
+     * }
+     * ```
+     *
+     * @returns Returns the newly created address or an error.
+     */
+    public addSubWallet(): ([string, undefined] | [undefined, WalletError]) {
+        const currentHeight: number = this.walletSynchronizer.getHeight();
+
+        return this.subWallets.addSubWallet(currentHeight);
+    }
+
+    /**
+     * Imports a subwallet to the wallet container. Must not be used on a view
+     * only wallet. For more information on subwallets, see https://docs.turtlecoin.lol/developer/subwallets
+     *
+     * Example:
+     * ```javascript
+     * const [address, error] = await wallet.importSubWallet('c984628484a1a5eaab4cfb63831b2f8ac8c3a56af2102472ab35044b46742501');
+     *
+     * if (!error) {
+     *      console.log(`Imported subwallet with address of ${address}`);
+     * } else {
+     *      console.log(`Failed to import subwallet: ${error.toString()}`);
+     * }
+     * ```
+     *
+     * @param privateSpendKey The private spend key of the subwallet to import
+     * @param scanHeight The scan height to start scanning this subwallet from.
+     *                   If the scan height is less than the wallets current
+     *                   height, the entire wallet will be rewound to that height,
+     *                   and will restart syncing. If not specified, this defaults
+     *                   to the current height.
+     * @returns Returns the newly created address or an error.
+     */
+    public async importSubWallet(
+        privateSpendKey: string,
+        scanHeight?: number): Promise<([string, undefined] | [undefined, WalletError])> {
+
+        const currentHeight: number = this.walletSynchronizer.getHeight();
+
+        if (scanHeight === undefined) {
+            scanHeight = currentHeight;
+        }
+
+        assertString(privateSpendKey, 'privateSpendKey');
+        assertNumber(scanHeight, 'scanHeight');
+
+        if (!isHex64(privateSpendKey)) {
+            return [undefined, new WalletError(WalletErrorCode.INVALID_KEY_FORMAT)];
+        }
+
+        const [error, address] = this.subWallets.importSubWallet(privateSpendKey, scanHeight);
+
+        /* If the import height is lower than the current height then we need
+         * to go back and rescan those blocks with the new subwallet. */
+        if (!error) {
+            if (currentHeight > scanHeight) {
+                await this.rewind(scanHeight);
+            }
+        }
+
+        /* Since we destructured the components, compiler can no longer figure
+         * out it's either [string, undefined], or [undefined, WalletError] -
+         * it could possibly be [string, WalletError] */
+        return [error, address] as [string, undefined] | [undefined, WalletError];
+    }
+
+    /**
+     * Imports a view only subwallet to the wallet container. Must not be used
+     * on a non view wallet. For more information on subwallets, see https://docs.turtlecoin.lol/developer/subwallets
+     *
+     * Example:
+     * ```javascript
+     * const [address, error] = await wallet.importViewSubWallet('c984628484a1a5eaab4cfb63831b2f8ac8c3a56af2102472ab35044b46742501');
+     *
+     * if (!error) {
+     *      console.log(`Imported view subwallet with address of ${address}`);
+     * } else {
+     *      console.log(`Failed to import view subwallet: ${error.toString()}`);
+     * }
+     * ```
+     *
+     * @param publicSpendKey The public spend key of the subwallet to import
+     * @param scanHeight The scan height to start scanning this subwallet from.
+     *                   If the scan height is less than the wallets current
+     *                   height, the entire wallet will be rewound to that height,
+     *                   and will restart syncing. If not specified, this defaults
+     *                   to the current height.
+     * @returns Returns the newly created address or an error.
+     */
+
+    public async importViewSubWallet(
+        publicSpendKey: string,
+        scanHeight?: number): Promise<([string, undefined] | [undefined, WalletError])> {
+
+        const currentHeight: number = this.walletSynchronizer.getHeight();
+
+        if (scanHeight === undefined) {
+            scanHeight = currentHeight;
+        }
+
+        assertString(publicSpendKey, 'publicSpendKey');
+        assertNumber(scanHeight, 'scanHeight');
+
+        if (!isHex64(publicSpendKey)) {
+            return [undefined, new WalletError(WalletErrorCode.INVALID_KEY_FORMAT)];
+        }
+
+        const [error, address] = this.subWallets.importViewSubWallet(publicSpendKey, scanHeight);
+
+        /* If the import height is lower than the current height then we need
+         * to go back and rescan those blocks with the new subwallet. */
+        if (!error) {
+            if (currentHeight > scanHeight) {
+                await this.rewind(scanHeight);
+            }
+        }
+
+        /* Since we destructured the components, compiler can no longer figure
+         * out it's either [string, undefined], or [undefined, WalletError] -
+         * it could possibly be [string, WalletError] */
+        return [error, address] as [string, undefined] | [undefined, WalletError];
+    }
+
+    /**
+     * Removes the subwallet specified from the wallet container. If you have
+     * not backed up the private keys for this subwallet, all funds in it
+     * will be lost.
+     *
+     * Example:
+     * ```javascript
+     * const error = wallet.deleteSubWallet('TRTLv2txGW8daTunmAVV6dauJgEv1LezM2Hse7EUD5c11yKHsNDrzQ5UWNRmu2ToQVhDcr82ZPVXy4mU5D7w9RmfR747KeXD3UF');
+     *
+     * if (error) {
+     *      console.log(`Failed to delete subwallet: ${error.toString()}`);
+     * }
+     * ```
+     *
+     * @param address The subwallet address to remove
+     */
+    public deleteSubWallet(address: string): WalletError {
+        assertString(address, 'address');
+
+        const err: WalletError = validateAddresses(
+            new Array(address), false, this.config,
+        );
+
+        if (!_.isEqual(err, SUCCESS)) {
+            return err;
+        }
+
+        return this.subWallets.deleteSubWallet(address);
+    }
+
+    /**
+     * Returns the number of subwallets in this wallet.
+     *
+     * Example:
+     * ```javascript
+     * const count = wallet.getWalletCount();
+     *
+     * console.log(`Wallet has ${count} subwallets`);
+     * ```
+     */
+    public getWalletCount(): number {
+        return this.subWallets.getWalletCount();
     }
 
     /**
@@ -1929,7 +2102,7 @@ export class WalletBackend extends EventEmitter {
         for (const [publicKey, input] of txData.inputsToAdd) {
 
             logger.log(
-                'Adding input ' + input.key,
+                `Adding input ${input.key} with keyimage ${input.keyImage}`,
                 LogLevel.DEBUG,
                 LogCategory.SYNC,
             );
@@ -1939,12 +2112,17 @@ export class WalletBackend extends EventEmitter {
 
         /* Mark any spent key images */
         for (const [publicKey, keyImage] of txData.keyImagesToMarkSpent) {
+            logger.log(
+                `Marking input with keyimage ${keyImage} as spent`,
+                LogLevel.DEBUG,
+                LogCategory.SYNC,
+            );
+
             this.subWallets.markInputAsSpent(publicKey, keyImage, blockHeight);
         }
 
         /* Store any transactions */
         for (const transaction of txData.transactionsToAdd) {
-
             logger.log(
                 'Adding transaction ' + transaction.hash,
                 LogLevel.INFO,
@@ -1995,11 +2173,17 @@ export class WalletBackend extends EventEmitter {
      */
     private async processBlocks(sleep: boolean): Promise<boolean> {
         /* Take the blocks to process for this tick */
-        const blocks: Block[] = await this.walletSynchronizer.fetchBlocks(this.config.blocksPerTick);
+        const [blocks, failCount] = await this.walletSynchronizer.fetchBlocks(this.config.blocksPerTick);
 
         if (blocks.length === 0) {
+            let sleepMultiplier: number = failCount === 0 ? 1 : failCount;
+
+            if (sleepMultiplier > 10) {
+                sleepMultiplier = 10;
+            }
+
             if (sleep) {
-                await delay(this.config.daemonUpdateInterval);
+                await delay(sleepMultiplier * this.config.daemonUpdateInterval);
             }
 
             return false;
@@ -2130,15 +2314,24 @@ export class WalletBackend extends EventEmitter {
         };
     }
 
-    /**
-     * Initialize stuff not stored in the JSON.
-     */
-    private initAfterLoad(daemon: IDaemon, config: Config): void {
-        this.config = config;
-        this.daemon = daemon;
+    private setupMetronomes() {
+        this.syncThread = new Metronome(
+            () => this.sync(true),
+            this.config.syncThreadInterval,
+        );
 
-        this.daemon.updateConfig(config);
+        this.daemonUpdateThread = new Metronome(
+            () => this.updateDaemonInfo(),
+            this.config.daemonUpdateInterval,
+        );
 
+        this.lockedTransactionsCheckThread = new Metronome(
+            () => this.checkLockedTransactions(),
+            this.config.lockedTransactionsCheckInterval,
+        );
+    }
+
+    private setupEventHandlers() {
         /* Passing through events from daemon to users */
         this.daemon.on('disconnect', () => {
             this.emit('disconnect');
@@ -2155,9 +2348,19 @@ export class WalletBackend extends EventEmitter {
                 localDaemonBlockCount,
                 networkDaemonBlockCount,
             );
+
+            this.haveEmittedDeadNode = false;
         });
 
-        this.walletSynchronizer.initAfterLoad(this.subWallets, daemon, this.config);
+        /* Compiler being really stupid and can't figure out how to fix.. */
+        this.daemon.on('deadnode' as any, () => {
+            if (!this.haveEmittedDeadNode) {
+                this.haveEmittedDeadNode = true;
+                this.emit('deadnode');
+            }
+        });
+
+        this.walletSynchronizer.initAfterLoad(this.subWallets, this.daemon, this.config);
 
         this.walletSynchronizer.on('heightchange', (walletHeight) => {
             this.emit(
@@ -2166,24 +2369,41 @@ export class WalletBackend extends EventEmitter {
                 this.daemon.getLocalDaemonBlockCount(),
                 this.daemon.getNetworkBlockCount()
             );
+
+            this.haveEmittedDeadNode = false;
         });
+
+        this.walletSynchronizer.on('deadnode', () => {
+            if (!this.haveEmittedDeadNode) {
+                this.haveEmittedDeadNode = true;
+                this.emit('deadnode');
+            }
+        });
+    }
+
+    /**
+     * Initialize stuff not stored in the JSON.
+     */
+    private initAfterLoad(daemon: IDaemon, config: Config): void {
+        this.synced = false;
+        this.started = false;
+        this.autoOptimize = true;
+        this.shouldPerformAutoOptimize = true;
+        this.currentlyOptimizing = false;
+        this.currentlyTransacting = false;
+        this.haveEmittedDeadNode = false;
+
+        this.config = config;
+        this.daemon = daemon;
+
+        this.daemon.updateConfig(config);
+
+        this.setupEventHandlers();
 
         this.subWallets.initAfterLoad(this.config);
 
-        this.syncThread = new Metronome(
-            () => this.sync(true),
-            this.config.syncThreadInterval,
-        );
+        this.setupMetronomes();
 
-        this.daemonUpdateThread = new Metronome(
-            () => this.updateDaemonInfo(),
-            this.config.daemonUpdateInterval,
-        );
-
-        this.lockedTransactionsCheckThread = new Metronome(
-            () => this.checkLockedTransactions(),
-            this.config.lockedTransactionsCheckInterval,
-        );
     }
 
     /**
