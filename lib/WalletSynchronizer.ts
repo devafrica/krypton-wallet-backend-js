@@ -24,6 +24,7 @@ import {
 
 /**
  * Decrypts blocks for our transactions and inputs
+ * @noInheritDoc
  */
 export class WalletSynchronizer extends EventEmitter {
 
@@ -90,6 +91,17 @@ export class WalletSynchronizer extends EventEmitter {
      */
     private finishedFunc: (() => void) | undefined = undefined;
 
+    /**
+     * Number of times we've failed to fetch blocks.
+     */
+    private failCount: number = 0;
+
+    /**
+     * Last time we fetched blocks from the daemon. If this goes over the
+     * configured limit, we'll emit deadnode.
+     */
+    private lastDownloadedBlocks: Date = new Date();
+    
     private config: Config = new Config();
 
     constructor(
@@ -127,6 +139,8 @@ export class WalletSynchronizer extends EventEmitter {
         this.storedBlocks = [];
         this.config = config;
         this.cancelledTransactionsFailCount = new Map();
+        this.lastDownloadedBlocks = new Date();
+        this.failCount = 0;
     }
 
     /**
@@ -272,6 +286,12 @@ export class WalletSynchronizer extends EventEmitter {
             return [];
         }
 
+        logger.log(
+            'Checking locked transactions',
+            LogLevel.DEBUG,
+            LogCategory.TRANSACTIONS,
+        );
+
         const cancelled: string[] = await this.daemon.getCancelledTransactions(transactionHashes);
 
         const toRemove: string[] = [];
@@ -283,11 +303,31 @@ export class WalletSynchronizer extends EventEmitter {
                 if (failCount === 10) {
                     toRemove.push(hash);
                     this.cancelledTransactionsFailCount.delete(hash);
+
+                    logger.log(
+                        `Unconfirmed transaction ${hash} is still not known by daemon after ${failCount} queries. ` +
+                        'Assuming transaction got dropped from mempool, returning funds and removing unconfirmed transaction.',
+                        LogLevel.DEBUG,
+                        LogCategory.TRANSACTIONS,
+                    );
+
                 } else {
+                    logger.log(
+                        `Unconfirmed transaction ${hash} is not known by daemon, query ${failCount + 1}.`,
+                        LogLevel.DEBUG,
+                        LogCategory.TRANSACTIONS,
+                    );
+
                     this.cancelledTransactionsFailCount.set(hash, failCount + 1);
                 }
             /* Hash has since been found, remove from fail count array */
             } else {
+                logger.log(
+                    `Unconfirmed transaction ${hash} is known by daemon, removing from possibly cancelled transactions array.`,
+                    LogLevel.DEBUG,
+                    LogCategory.TRANSACTIONS,
+                );
+
                 this.cancelledTransactionsFailCount.delete(hash);
             }
         }
@@ -295,6 +335,12 @@ export class WalletSynchronizer extends EventEmitter {
         for (const hash of cancelled) {
             /* Transaction with no history, first fail, add to map. */
             if (!this.cancelledTransactionsFailCount.has(hash)) {
+                logger.log(
+                    `Unconfirmed transaction ${hash} is not known by daemon, query 1.`,
+                    LogLevel.DEBUG,
+                    LogCategory.TRANSACTIONS,
+                );
+
                 this.cancelledTransactionsFailCount.set(hash, 1);
             }
         }
@@ -306,19 +352,37 @@ export class WalletSynchronizer extends EventEmitter {
      * Retrieve blockCount blocks from the internal store. Does not remove
      * them.
      */
-    public async fetchBlocks(blockCount: number): Promise<Block[]> {
+    public async fetchBlocks(blockCount: number): Promise<[Block[], number]> {
         /* Fetch more blocks if we haven't got any downloaded yet */
         if (this.storedBlocks.length === 0) {
             logger.log(
-                'No blocks stored, fetching more.',
+                'No blocks stored, attempting to fetch more.',
                 LogLevel.DEBUG,
                 LogCategory.SYNC,
             );
 
-            await this.downloadBlocks();
+            const [check, downloadSuccess] = await this.downloadBlocks();
+
+            /* In the middle of fetching blocks, don't need to fetch blocks, etc */
+            if (check) {
+                if (!downloadSuccess) {
+                    this.failCount++;
+
+                    /* Seconds since we last got a block */
+                    const diff = (new Date().getTime() - this.lastDownloadedBlocks.getTime()) / 1000;
+
+                    if (diff > this.config.maxLastFetchedBlockInterval) {
+                        this.emit('deadnode');
+                    }
+
+                } else {
+                    this.lastDownloadedBlocks = new Date();
+                    this.failCount = 0;
+                }
+            }
         }
 
-        return _.take(this.storedBlocks, blockCount);
+        return [_.take(this.storedBlocks, blockCount), this.failCount];
     }
 
     public dropBlock(blockHeight: number, blockHash: string): void {
@@ -337,7 +401,23 @@ export class WalletSynchronizer extends EventEmitter {
         /* sizeof() gets a tad expensive... */
         if (blockHeight % 10 === 0 && this.shouldFetchMoreBlocks()) {
             /* Note - not awaiting here */
-            this.downloadBlocks();
+            this.downloadBlocks().then(([check, downloadSuccess]) => {
+                if (check) {
+                    if (!downloadSuccess) {
+                        this.failCount++;
+
+                        /* Seconds since we last got a block */
+                        const diff = (new Date().getTime() - this.lastDownloadedBlocks.getTime()) / 1000;
+
+                        if (diff > this.config.maxLastFetchedBlockInterval) {
+                            this.emit('deadnode');
+                        }
+                    } else {
+                        this.lastDownloadedBlocks = new Date();
+                        this.failCount = 0;
+                    }
+                }
+            });
         }
     }
 
@@ -358,6 +438,11 @@ export class WalletSynchronizer extends EventEmitter {
     private shouldFetchMoreBlocks(): boolean {
         /* Don't fetch more if we're already doing so */
         if (this.fetchingBlocks) {
+            return false;
+        }
+
+        /* Don't fetch more blocks if we've failed to fetch blocks multiple times */
+        if (this.failCount > 2) {
             return false;
         }
 
@@ -391,10 +476,10 @@ export class WalletSynchronizer extends EventEmitter {
                 .concat(blockHashCheckpoints);
     }
 
-    private async downloadBlocks(): Promise<void> {
+    private async downloadBlocks(): Promise<[boolean, boolean]> {
         /* Don't make more than one fetch request at once */
         if (this.fetchingBlocks) {
-            return;
+            return [false, true];
         }
 
         this.fetchingBlocks = true;
@@ -404,7 +489,7 @@ export class WalletSynchronizer extends EventEmitter {
 
         if (localDaemonBlockCount < walletBlockCount) {
             this.fetchingBlocks = false;
-            return;
+            return [false, true];
         }
 
         /* Get the checkpoints of the blocks we've got stored, so we can fetch
@@ -413,7 +498,7 @@ export class WalletSynchronizer extends EventEmitter {
         const blockCheckpoints: string[] = this.getBlockCheckpoints();
 
         let blocks: Block[] = [];
-        let topBlock: TopBlock | undefined;
+        let topBlock: TopBlock | boolean;
 
         try {
             [blocks, topBlock] = await this.daemon.getWalletSyncData(
@@ -433,20 +518,21 @@ export class WalletSynchronizer extends EventEmitter {
 
             this.fetchingBlocks = false;
 
-            return;
+            return [true, false];
         }
 
-        if (topBlock && blocks.length === 0) {
+        if (typeof topBlock === 'object' && blocks.length === 0) {
             if (this.finishedFunc) {
                 this.finishedFunc();
             }
 
-            this.synchronizationStatus.storeBlockHash(topBlock.height, topBlock.hash);
-
             /* Synced, store the top block so sync status displays correctly if
-               we are not scanning coinbase tx only blocks. */
+               we are not scanning coinbase tx only blocks.
+               Only store top block if we have finished processing stored
+               blocks */
             if (this.storedBlocks.length === 0) {
                 this.emit('heightchange', topBlock.height);
+                this.synchronizationStatus.storeBlockHash(topBlock.height, topBlock.hash);
             }
 
             logger.log(
@@ -461,7 +547,7 @@ export class WalletSynchronizer extends EventEmitter {
 
             this.fetchingBlocks = false;
 
-            return;
+            return [true, true];
         }
 
         if (blocks.length === 0) {
@@ -477,7 +563,7 @@ export class WalletSynchronizer extends EventEmitter {
 
             this.fetchingBlocks = false;
 
-            return;
+            return [true, topBlock as boolean];
         }
 
         /* Timestamp is transient and can change - block height is constant. */
@@ -498,6 +584,8 @@ export class WalletSynchronizer extends EventEmitter {
         }
 
         this.fetchingBlocks = false;
+
+        return [true, true];
     }
 
     /**
@@ -533,7 +621,7 @@ export class WalletSynchronizer extends EventEmitter {
             /* Not spent yet! */
             const spendHeight: number = 0;
 
-            const keyImage = await this.subWallets.getTxInputKeyImage(
+            const [keyImage, privateEphemeral] = await this.subWallets.getTxInputKeyImage(
                 ownerSpendKey, derivation, outputIndex,
             );
 
@@ -541,6 +629,7 @@ export class WalletSynchronizer extends EventEmitter {
                 keyImage, output.amount, blockHeight,
                 rawTX.transactionPublicKey, outputIndex, output.globalIndex,
                 output.key, spendHeight, rawTX.unlockTime, rawTX.hash,
+                privateEphemeral,
             );
 
             inputs.push([ownerSpendKey, txInput]);

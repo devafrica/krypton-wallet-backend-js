@@ -19,6 +19,9 @@ import { validateAddresses } from './ValidateParameters';
 import { LogCategory, logger, LogLevel } from './Logger';
 import { WalletError, WalletErrorCode } from './WalletError';
 
+/**
+ * @noInheritDoc
+ */
 export class Daemon extends EventEmitter implements IDaemon {
 
     /**
@@ -94,6 +97,18 @@ export class Daemon extends EventEmitter implements IDaemon {
         maxSockets: Infinity,
         keepAliveMsecs: 20000,
     });
+
+    /**
+     * Last time the network height updated. If this goes over the configured
+     * limit, we'll emit deadnode.
+     */
+    private lastUpdatedNetworkHeight: Date = new Date();
+
+    /**
+     * Last time the daemon height updated. If this goes over the configured
+     * limit, we'll emit deadnode.
+     */
+    private lastUpdatedLocalHeight: Date = new Date();
 
     /**
      * Did our last contact with the daemon succeed. Set to true initially
@@ -172,6 +187,10 @@ export class Daemon extends EventEmitter implements IDaemon {
     public async init(): Promise<void> {
         /* Note - if one promise throws, the other will be cancelled */
         await Promise.all([this.updateDaemonInfo(), this.updateFeeInfo()]);
+
+        if (this.networkBlockCount === 0) {
+            this.emit('deadnode');
+        }
     }
 
     /**
@@ -191,6 +210,14 @@ export class Daemon extends EventEmitter implements IDaemon {
                 [LogCategory.DAEMON],
             );
 
+            const diff1 = (new Date().getTime() - this.lastUpdatedNetworkHeight.getTime()) / 1000;
+            const diff2 = (new Date().getTime() - this.lastUpdatedLocalHeight.getTime()) / 1000;
+
+            if (diff1 > this.config.maxLastUpdatedNetworkHeightInterval
+             || diff2 > this.config.maxLastUpdatedLocalHeightInterval) {
+                this.emit('deadnode');
+            }
+
             return;
         }
 
@@ -199,6 +226,14 @@ export class Daemon extends EventEmitter implements IDaemon {
         if (info.height === undefined && !haveDeterminedSsl) {
             this.sslDetermined = true;
             this.ssl = false;
+
+            const diff1 = (new Date().getTime() - this.lastUpdatedNetworkHeight.getTime()) / 1000;
+            const diff2 = (new Date().getTime() - this.lastUpdatedLocalHeight.getTime()) / 1000;
+
+            if (diff1 > this.config.maxLastUpdatedNetworkHeightInterval
+             || diff2 > this.config.maxLastUpdatedLocalHeightInterval) {
+                this.emit('deadnode');
+            }
 
             return this.updateDaemonInfo();
         }
@@ -223,6 +258,17 @@ export class Daemon extends EventEmitter implements IDaemon {
         if (this.localDaemonBlockCount !== info.height 
          || this.networkBlockCount !== info.network_height) {
             this.emit('heightchange', info.height, info.network_height);
+
+            this.lastUpdatedNetworkHeight = new Date();
+            this.lastUpdatedLocalHeight = new Date();
+        } else {
+            const diff1 = (new Date().getTime() - this.lastUpdatedNetworkHeight.getTime()) / 1000;
+            const diff2 = (new Date().getTime() - this.lastUpdatedLocalHeight.getTime()) / 1000;
+
+            if (diff1 > this.config.maxLastUpdatedNetworkHeightInterval
+             || diff2 > this.config.maxLastUpdatedLocalHeightInterval) {
+                this.emit('deadnode');
+            }
         }
 
         this.localDaemonBlockCount = info.height;
@@ -255,7 +301,7 @@ export class Daemon extends EventEmitter implements IDaemon {
         blockHashCheckpoints: string[],
         startHeight: number,
         startTimestamp: number,
-        blockCount: number): Promise<[Block[], TopBlock | undefined]> {
+        blockCount: number): Promise<[Block[], TopBlock | boolean]> {
 
         let data;
 
@@ -274,14 +320,20 @@ export class Daemon extends EventEmitter implements IDaemon {
                 [LogCategory.DAEMON],
             );
 
-            return [[], undefined];
+            return [[], false];
+        }
+
+        /* The node is not dead if we're fetching blocks. */
+        if (data.items.length >= 0) {
+            this.lastUpdatedNetworkHeight = new Date();
+            this.lastUpdatedLocalHeight = new Date();
         }
 
         if (data.synced && data.topBlock && data.topBlock.height && data.topBlock.hash) {
             return [data.items.map(Block.fromJSON), data.topBlock];
         }
 
-        return [data.items.map(Block.fromJSON), undefined];
+        return [data.items.map(Block.fromJSON), true];
     }
 
     /**
@@ -396,12 +448,23 @@ export class Daemon extends EventEmitter implements IDaemon {
         return outputs;
     }
 
-    public async sendTransaction(rawTransaction: string): Promise<boolean> {
+    public async sendTransaction(rawTransaction: string): Promise<[boolean, string | undefined]> {
         const result = await this.makePostRequest('/sendrawtransaction', {
             tx_as_hex: rawTransaction,
         });
 
-        return result.status.toUpperCase() === 'OK';
+        /* Success. */
+        if (result.status.toUpperCase() === 'OK') {
+            return [true, undefined];
+        }
+
+        /* Fail, no extra error message. */
+        if (!result || !result.status || !result.error) {
+            return [false, undefined];
+        }
+
+        /* Fail, extra error message */
+        return [false, result.error];
     }
 
     public getConnectionInfo(): DaemonConnection {
@@ -470,14 +533,26 @@ export class Daemon extends EventEmitter implements IDaemon {
      * Makes a get request to the given endpoint
      */
     private async makeRequest(endpoint: string, method: string, body?: any): Promise<any> {
+        const options = {
+            body,
+            json: true,
+            method,
+            timeout: this.config.requestTimeout,
+            headers: { 'User-Agent': this.config.customUserAgentString },
+        };
+
         try {
             const protocol = this.sslDetermined ? (this.ssl ? 'https' : 'http') : 'https';
 
+            logger.log(
+                `Making request to ${endpoint} with params ${body ? JSON.stringify(body) : '{}'}`,
+                LogLevel.TRACE,
+                [LogCategory.DAEMON],
+            );
+
             const data = await request({
-                body: body,
-                json: true,
-                method: method,
-                timeout: this.config.requestTimeout,
+                ...options,
+                ...this.config.customRequestOptions,
                 /* Start by trying HTTPS if we haven't determined whether it's
                    HTTPS or HTTP yet. */
                 url: `${protocol}://${this.host}:${this.port}${endpoint}`,
@@ -495,6 +570,12 @@ export class Daemon extends EventEmitter implements IDaemon {
                 this.connected = true;
             }
 
+            logger.log(
+                `Got response from ${endpoint} with body ${JSON.stringify(data)}`,
+                LogLevel.TRACE,
+                [LogCategory.DAEMON],
+            );
+
             return data;
         } catch (err) {
             /* No point trying again with SSL - we already have decided what
@@ -510,10 +591,7 @@ export class Daemon extends EventEmitter implements IDaemon {
 
             try {
                 const data = await request({
-                    body: body,
-                    json: true,
-                    method: method,
-                    timeout: this.config.requestTimeout,
+                    ...options,
                     /* Lets try HTTP now. */
                     url: `http://${this.host}:${this.port}${endpoint}`,
                     agent: this.httpAgent,
@@ -526,6 +604,12 @@ export class Daemon extends EventEmitter implements IDaemon {
                     this.emit('connect');
                     this.connected = true;
                 }
+
+                logger.log(
+                    `Got response from ${method} with body ${JSON.stringify(data)}`,
+                    LogLevel.TRACE,
+                    [LogCategory.DAEMON],
+                );
 
                 return data;
 

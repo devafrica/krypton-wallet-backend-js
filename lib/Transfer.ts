@@ -24,7 +24,7 @@ import {
 
 import {
     addressToKeys, getMaxTxSize, prettyPrintAmount, prettyPrintBytes,
-    splitAmountIntoDenominations,
+    splitAmountIntoDenominations, isHex64,
 } from './Utilities';
 
 import {
@@ -361,7 +361,7 @@ async function makeTransaction(
     daemon: IDaemon,
     config: Config): Promise<([CreatedTransaction, undefined]) | ([undefined, WalletError])> {
 
-    const amounts: Array<[string, number]> = [];
+    let amounts: Array<[string, number]> = [];
 
     /* Split amounts into denominations */
     addressesAndAmounts.map(([address, amount]) => {
@@ -369,6 +369,8 @@ async function makeTransaction(
             amounts.push([address, denomination]);
         }
     });
+
+    amounts = _.sortBy(amounts, ([address, amount]) => amount);
 
     /* Prepare destinations keys */
     const transfers: TxDestination[] = amounts.map(([address, amount]) => {
@@ -385,6 +387,8 @@ async function makeTransaction(
         };
     });
 
+    ourInputs = _.sortBy(ourInputs, (input) => input.input.amount);
+
     const randomOuts: WalletError | RandomOutput[][] = await getRingParticipants(
         ourInputs, mixin, daemon, config,
     );
@@ -393,27 +397,44 @@ async function makeTransaction(
         return [undefined, randomOuts as WalletError];
     }
 
+    let numPregenerated = 0;
+    let numGeneratedOnDemand = 0;
+
     const ourOutputs: Output[] = await Promise.all(ourInputs.map(async (input) => {
-        const [keyImage, tmpSecretKey] = await generateKeyImage(
-            input.input.transactionPublicKey,
-            subWallets.getPrivateViewKey(),
-            input.publicSpendKey,
-            input.privateSpendKey,
-            input.input.transactionIndex,
-            config,
-        );
+        if (typeof input.input.privateEphemeral !== 'string' || !isHex64(input.input.privateEphemeral)) {
+            const [keyImage, tmpSecretKey] = await generateKeyImage(
+                input.input.transactionPublicKey,
+                subWallets.getPrivateViewKey(),
+                input.publicSpendKey,
+                input.privateSpendKey,
+                input.input.transactionIndex,
+                config,
+            );
+
+            input.input.privateEphemeral = tmpSecretKey;
+
+            numGeneratedOnDemand++;
+        } else {
+            numPregenerated++;
+        }
 
         return {
             amount: input.input.amount,
             globalIndex: input.input.globalOutputIndex as number,
             index: input.input.transactionIndex,
             input: {
-                privateEphemeral: tmpSecretKey,
+                privateEphemeral: input.input.privateEphemeral,
             },
             key: input.input.key,
-            keyImage: keyImage,
+            keyImage: input.input.keyImage,
         };
     }));
+
+    logger.log(
+        `Generated key images for ${numGeneratedOnDemand} inputs, used pre-generated key images for ${numPregenerated} inputs.`,
+        LogLevel.DEBUG,
+        LogCategory.TRANSACTIONS,
+    );
 
     try {
         const tx = await CryptoUtils(config).createTransactionAsync(
@@ -438,6 +459,12 @@ async function verifyAndSendTransaction(
     daemon: IDaemon,
     config: Config): Promise<([TX, string, undefined]) | ([undefined, undefined, WalletError])> {
 
+    logger.log(
+        `Created transaction: ${JSON.stringify(tx.transaction)}`,
+        LogLevel.TRACE,
+        LogCategory.TRANSACTIONS
+    );
+
     /* Check the transaction isn't too large to fit in a block */
     const tooBigErr: WalletError = isTransactionPayloadTooBig(
         tx.rawTransaction, daemon.getNetworkBlockCount(), config
@@ -453,23 +480,32 @@ async function verifyAndSendTransaction(
         return [undefined, undefined, new WalletError(WalletErrorCode.AMOUNTS_NOT_PRETTY)];
     }
 
-    /* Check the transaction is zero fee */
+    /* Check the transaction has the fee that we expect (0 for fusion) */
     if (!verifyTransactionFee(tx.transaction, fee)) {
         return [undefined, undefined, new WalletError(WalletErrorCode.UNEXPECTED_FEE)];
     }
 
     let relaySuccess: boolean;
+    let errorMessage: string | undefined;
 
     try {
-        relaySuccess = await daemon.sendTransaction(tx.rawTransaction);
+        [relaySuccess, errorMessage] = await daemon.sendTransaction(tx.rawTransaction);
 
     /* Timeout */
     } catch (err) {
+        if (err.statusCode === 504) {
+            return [undefined, undefined, new WalletError(WalletErrorCode.DAEMON_STILL_PROCESSING)];
+        }
+
         return [undefined, undefined, new WalletError(WalletErrorCode.DAEMON_OFFLINE)];
     }
 
     if (!relaySuccess) {
-        return [undefined, undefined, new WalletError(WalletErrorCode.DAEMON_ERROR)];
+        const customMessage = errorMessage === undefined 
+            ? ''
+            : `The daemon did not accept our transaction. Error: ${errorMessage}. You may need to resync your wallet.`;
+
+        return [undefined, undefined, new WalletError(WalletErrorCode.DAEMON_ERROR, customMessage)];
     }
 
     /* Store the unconfirmed transaction, update our balance */
@@ -547,6 +583,12 @@ async function storeSentTransaction(
     );
 
     subWallets.addUnconfirmedTransaction(tx);
+
+    logger.log(
+        `Stored unconfirmed transaction: ${JSON.stringify(tx)}`,
+        LogLevel.TRACE,
+        LogCategory.TRANSACTIONS,
+    );
 
     return tx;
 }

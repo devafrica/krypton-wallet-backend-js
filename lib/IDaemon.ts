@@ -80,7 +80,7 @@ export interface IDaemon {
         blockHashCheckpoints: string[],
         startHeight: number,
         startTimestamp: number,
-        blockCount: number): Promise<[Block[], TopBlock | undefined]>;
+        blockCount: number): Promise<[Block[], TopBlock | boolean]>;
 
     /**
      * Gets the node fee address and amount. Will be `['', 0]` if none/invalid
@@ -141,9 +141,10 @@ export interface IDaemon {
      *
      * Will throw on timeout.
      *
-     * @returns Whether the transaction was accepted
+     * @returns Whether the transaction was accepted and an optional extra
+     *          error message.
      */
-    sendTransaction(rawTransaction: string): Promise<boolean>;
+    sendTransaction(rawTransaction: string): Promise<[boolean, string | undefined]>;
 
     /**
      * Updates the internal config with the passed in config.

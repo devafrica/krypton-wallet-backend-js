@@ -14,7 +14,7 @@ Provides an interface to the Krypton (ZOD) network, allowing wallet applications
 
 ## Installation from GitHub
 
-If you need features which have not yet made it into a release yet, you can install from GitHub.
+If you need features which have not yet made it into a release, you can install from GitHub.
 
 NPM:
 
@@ -159,6 +159,41 @@ In this example, we only print messages that fall into the SYNC category.
 You can view available categories and log levels in the documentation.
 
 ## Changelog
+
+### v4.0.3
+
+* Update turtlecoin-utils
+* Add error code `DAEMON_STILL_PROCESSING` returned when a transaction may or may not have failed
+* Fix bug causing balance double counts with fusions in rare case
+
+### v4.0.2
+
+* Fix package.json not being published to NPM causing require() fail
+
+### v4.0.1
+
+* Fix auto-optimize not functioning after loading from file
+* Increase node threadpool size to prevent issues with timeouts
+* Sort outputs before requesting random outs
+
+### v4.0.0
+
+* Adds a `TRACE` log level for logging of daemon request+response data
+* Adds a simpler `validateAddress` function to the `ValidateParameters` module
+* Slightly improves the Auto Optimization implementation
+* Removes `BlockchainCacheApi` and `ConventionalDaemon` - Please use `Daemon` instead
+* Returns additional information from transaction failure when available
+* More logging information added
+* Transaction creation process sped up by not re-generating keyimages
+
+### v3.4.12
+
+* Adds a customizable user agent option to the config
+* Ring signatures are now always checked before sending
+
+### v3.4.11
+
+* Add `on('deadnode')` event
 
 ### v3.4.10
 

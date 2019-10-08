@@ -64,6 +64,26 @@ export function validateAddresses(
 }
 
 /**
+ * Verifies that the address given is valid.
+ * @param address The address to validate.
+ * @param integratedAddressAllowed Should an integrated address be allowed?
+ *
+ * @returns Returns true if the address is valid, otherwise returns false
+ *
+ */
+export function validateAddress(
+    address: string,
+    integratedAddressAllowed: boolean,
+    config?: IConfig): boolean {
+
+    const err: WalletError = validateAddresses(
+        new Array(address), integratedAddressAllowed, MergeConfig(config),
+    );
+
+    return err.errorCode === WalletErrorCode.SUCCESS;
+}
+
+/**
  * Validate the amounts being sent are valid, and the addresses are valid.
  *
  * @returns Returns SUCCESS if valid, otherwise a WalletError describing the error
@@ -269,10 +289,11 @@ export function validateMixin(
  *
  * @returns Returns SUCCESS if valid, otherwise a WalletError describing the error
  */
-export function validatePaymentID(paymentID: string): WalletError {
+export function validatePaymentID(paymentID: string, allowEmptyString: boolean = true): WalletError {
     assertString(paymentID, 'paymentID');
+    assertBoolean(allowEmptyString, 'allowEmptyString');
 
-    if (paymentID === '') {
+    if (paymentID === '' && allowEmptyString) {
         return SUCCESS;
     }
 
