@@ -1,32 +1,16 @@
-![image](https://user-images.githubusercontent.com/34389545/35821974-62e0e25c-0a70-11e8-87dd-2cfffeb6ed47.png)
-
-#### Master Build Status
-[![Build Status](https://travis-ci.org/turtlecoin/turtlecoin-wallet-backend-js.svg?branch=master)](https://travis-ci.org/turtlecoin/turtlecoin-wallet-backend-js)
-
-#### NPM
-[![NPM](https://nodei.co/npm/turtlecoin-wallet-backend.png?compact=true)](https://npmjs.org/package/turtlecoin-wallet-backend)
+![image](https://raw.githubusercontent.com/kryptonchain/krypton-wallet-gui/krypton_master/krypton-logo.png)
 
 #### Github
 
-https://github.com/turtlecoin/turtlecoin-wallet-backend-js
+https://github.com/kryptonchain/krypton-wallet-backend-js
 
-# turtlecoin-wallet-backend
+# krypton-wallet-backend
 
-Provides an interface to the TurtleCoin network, allowing wallet applications to be built.
+Provides an interface to the Krypton (ZOD) network, allowing wallet applications to be built.
 
 * Downloads blocks from the network, either through a traditional daemon, or a blockchain cache for increased speed
 * Processes blocks, decrypting transactions that belong to the user
 * Sends and receives transactions
-
-## Installation
-
-NPM:
-
-`npm install turtlecoin-wallet-backend --save`
-
-Yarn:
-
-`yarn add turtlecoin-wallet-backend`
 
 ## Installation from GitHub
 
@@ -34,11 +18,11 @@ If you need features which have not yet made it into a release yet, you can inst
 
 NPM:
 
-`npm install https://github.com/turtlecoin/turtlecoin-wallet-backend-js --save`
+`npm install https://github.com/kryptonchain/krypton-wallet-backend-js --save`
 
 Yarn:
 
-`yarn add https://github.com/turtlecoin/turtlecoin-wallet-backend-js`
+`yarn add https://github.com/kryptonchain/krypton-wallet-backend-js`
 
 ## Documentation
 
